@@ -3345,25 +3345,29 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 return;
             }
             
-            // 将 payload 发送给 SW
-            const metadata = {
-                charId: session.contactId,
-                sessionId: session.id,
-                origin: "push_service_background_reply"
-            };
-            
             console.log("[Background Handover] Handing over generation to background!");
             
-            navigator.serviceWorker?.controller?.postMessage({
-                type: "amsg-push-handover",
-                payload: {
-                    messages: lastKnownPromptMessages,
-                    apiUrl: lastKnownConfig.baseUrl,
-                    apiKey: lastKnownConfig.apiKey,
-                    primaryModel: lastKnownConfig.defaultModel,
-                    contactName: character?.name || "对方",
-                    metadata
-                }
+            import("@/lib/push-bailout-client").then(module => {
+                import("@/lib/llm-provider-adapter").then(adapterModule => {
+                    const requestMessages = adapterModule.toLlmRequestMessages(lastKnownPromptMessages);
+                    const request = adapterModule.buildProviderRequest(lastKnownConfig, null, requestMessages, { stream: false });
+                    
+                    module.armReplyBailout({
+                        sessionId: session.id,
+                        characterName: character?.name || "对方",
+                        userName: userIdentity?.name || "用户",
+                        regexes: activeRegexes,
+                        request: {
+                            url: request.url,
+                            headers: request.headers,
+                            body: request.body,
+                            providerKind: request.providerKind
+                        }
+                    }).then(handle => {
+                        // 因为是立即交接，我们不需要心跳续命，把租约结算掉，让服务端尽早触发
+                        handle?.settle();
+                    });
+                });
             });
             
             showPersistentChatToast("已转入后台生成，将通过通知送达");
