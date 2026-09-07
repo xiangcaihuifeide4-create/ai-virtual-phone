@@ -3293,9 +3293,94 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setIsGenerating(true);
         setGenerationLock(session.id);
 
+        // --- AMSG 后台接管 (能力 B) ---
+        let handedOverToBackground = false;
+        let gracePeriodTimer: NodeJS.Timeout | null = null;
+        let lastKnownConfig: any = null;
+        let lastKnownPromptMessages: any = null;
+        
+        const tryHandoverToBackground = (e?: Event) => {
+            if (handedOverToBackground) return; // 已经交接过了
+            
+            const isPagehide = e?.type === "pagehide";
+            // 只有当前还没输出任何文本增量时，才允许交接
+            const hasStartedOutput = streamAccumRef.current.trim().length > 0;
+            
+            if (hasStartedOutput) {
+                // 模型已经开始吐字了，就继续本地生成，不交接
+                if (gracePeriodTimer) { clearTimeout(gracePeriodTimer); gracePeriodTimer = null; }
+                return;
+            }
+            
+            if (document.visibilityState === "hidden" || isPagehide) {
+                // 如果是 pagehide 则直接无宽限期接管
+                if (isPagehide) {
+                    executeHandover();
+                } else if (!gracePeriodTimer) {
+                    // 开启几秒钟的宽限期
+                    gracePeriodTimer = setTimeout(() => {
+                        if (document.visibilityState === "hidden") {
+                            executeHandover();
+                        }
+                    }, 3000);
+                }
+            } else {
+                // 页面恢复可见，取消接管
+                if (gracePeriodTimer) {
+                    clearTimeout(gracePeriodTimer);
+                    gracePeriodTimer = null;
+                }
+            }
+        };
+
+        const executeHandover = () => {
+            if (handedOverToBackground || streamAccumRef.current.trim().length > 0) return;
+            handedOverToBackground = true;
+            
+            // 立即停止本地请求
+            generationRun.controller.abort();
+            
+            if (!lastKnownConfig || !lastKnownPromptMessages) {
+                console.warn("[Background Handover] Missing prompt payload, cannot handover");
+                return;
+            }
+            
+            // 将 payload 发送给 SW
+            const metadata = {
+                charId: session.contactId,
+                sessionId: session.id,
+                origin: "push_service_background_reply"
+            };
+            
+            console.log("[Background Handover] Handing over generation to background!");
+            
+            navigator.serviceWorker?.controller?.postMessage({
+                type: "amsg-push-handover",
+                payload: {
+                    messages: lastKnownPromptMessages,
+                    apiUrl: lastKnownConfig.baseUrl,
+                    apiKey: lastKnownConfig.apiKey,
+                    primaryModel: lastKnownConfig.defaultModel,
+                    contactName: character?.name || "对方",
+                    metadata
+                }
+            });
+            
+            showPersistentChatToast("已转入后台生成，将通过通知送达");
+        };
+
+        document.addEventListener("visibilitychange", tryHandoverToBackground);
+        window.addEventListener("pagehide", tryHandoverToBackground);
+
         try {
             if (session.isGroup) {
                 let roundReasoning: string | undefined;
+                // 拦截 build 阶段以获取 LLM Context，供接管使用
+                const { buildChatPromptMessages } = await import("@/lib/chat-engine");
+                const promptResult = await buildChatPromptMessages(session, history, { appId: "chat", appTags: theaterMode ? ["group_chat"] : undefined });
+                lastKnownConfig = promptResult.config;
+                lastKnownPromptMessages = promptResult.llmMessages;
+                
                 const results = await generateGroupChatCompletion(
                     session,
                     history,
@@ -3339,6 +3424,12 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 await processGroupParts(results, setMessages, generationGuard, roundReasoning, { instantReveal: isSessionStreamingEnabled(session, true) });
             } else {
                 let capturedReasoning: string | undefined;
+                // 拦截 build 阶段以获取 LLM Context，供接管使用
+                const { buildChatPromptMessages } = await import("@/lib/chat-engine");
+                const promptResult = await buildChatPromptMessages(session, history, { appId: "chat", appTags: theaterMode ? ["chat"] : ["chat", "text"] });
+                lastKnownConfig = promptResult.config;
+                lastKnownPromptMessages = promptResult.llmMessages;
+                
                 const cr = await generateChatCompletion(
                     session,
                     history,
@@ -3377,6 +3468,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 shouldRunDeclineReply = Boolean(result.hasDecline);
             }
         } catch (error: any) {
+            if (handedOverToBackground) return; // 接管后抛出的 AbortError，静默忽略
             if (!isCurrentGeneration() || isAbortLikeError(error)) return;
             const errorMsg = pushChatMessage({
                 sessionId: session.id,
@@ -3385,6 +3477,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             });
             setMessages(prev => [...prev, errorMsg]);
         } finally {
+            document.removeEventListener("visibilitychange", tryHandoverToBackground);
+            window.removeEventListener("pagehide", tryHandoverToBackground);
+            if (gracePeriodTimer) clearTimeout(gracePeriodTimer);
+            
             if (finishGenerationRun(session.id, generationRunId)) {
                 isGeneratingRef.current = false;
                 setIsGenerating(false);
