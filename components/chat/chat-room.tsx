@@ -1496,6 +1496,19 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         };
     }, [session.id, syncMessagesFromStorage]);
 
+    // --- 离线快照同步 ---
+    const snapshotSyncTimerRef = useRef<NodeJS.Timeout | null>(null);
+    useEffect(() => {
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === "hidden") {
+                // 页面转后台时，发送小包 keepalive 补传
+                // （这里依赖你在发送消息时已生成好最新的 llmMessages 并保存在某处，暂时按定时同步解决）
+            }
+        };
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+        return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+    }, []);
+
     // Listen for live CSS updates from 小卷
     useEffect(() => {
         const onCSSUpdate = (e: Event) => {
