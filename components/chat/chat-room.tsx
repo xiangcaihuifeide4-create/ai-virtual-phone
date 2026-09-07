@@ -1502,7 +1502,26 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         const handleVisibilityChange = () => {
             if (document.visibilityState === "hidden") {
                 // 页面转后台时，发送小包 keepalive 补传
-                // （这里依赖你在发送消息时已生成好最新的 llmMessages 并保存在某处，暂时按定时同步解决）
+                if (snapshotSyncTimerRef.current) {
+                    clearTimeout(snapshotSyncTimerRef.current);
+                }
+                // 使用当前的 messages 立刻跑一次同步，带有 isKeepalive = true
+                import("@/lib/chat-engine").then(engine => {
+                    engine.buildChatPromptMessages(session, messages, { appId: "chat" }).then(res => {
+                        import("@/lib/chat-push-snapshot").then(snap => {
+                            const userName = userIdentity?.name || "用户";
+                            snap.syncSnapshotToServer(
+                                session,
+                                character?.name || "对方",
+                                userName,
+                                res.llmMessages,
+                                messages,
+                                { baseUrl: res.config.baseUrl, apiKey: res.config.apiKey, model: res.config.defaultModel },
+                                true // keepalive!
+                            );
+                        });
+                    });
+                });
             }
         };
         document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -1571,6 +1590,46 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         return () => window.removeEventListener(CHAT_BG_COMPLETE, handler);
     }, [session.id, syncMessagesFromStorage]);
 
+
+    // --- 离线快照同步触发点 ---
+    const triggerSnapshotSync = useCallback(async (currentHistory: ChatMessage[]) => {
+        if (!character) return;
+        try {
+            const { buildChatPromptMessages } = await import("@/lib/chat-engine");
+            const { buildPersonaSnapshot, syncSnapshotToServer } = await import("@/lib/chat-push-snapshot");
+            
+            // 组装当前最新上下文
+            const { llmMessages, config } = await buildChatPromptMessages(session, currentHistory, {
+                appId: "chat"
+            });
+            
+            const userName = userIdentity?.name || "用户";
+            
+            // 发起同步
+            await syncSnapshotToServer(
+                session,
+                character.name,
+                userName,
+                llmMessages,
+                currentHistory,
+                { baseUrl: config.baseUrl, apiKey: config.apiKey, model: config.defaultModel }
+            );
+        } catch (e) {
+            console.warn("[Snapshot] Sync error:", e);
+        }
+    }, [character, session, userIdentity]);
+
+    // 监听消息落库，延迟触发快照同步
+    useEffect(() => {
+        if (snapshotSyncTimerRef.current) clearTimeout(snapshotSyncTimerRef.current);
+        // 使用 10 秒防抖，避免高频打字时频繁同步
+        snapshotSyncTimerRef.current = setTimeout(() => {
+            triggerSnapshotSync(messages);
+        }, 10000);
+        return () => {
+            if (snapshotSyncTimerRef.current) clearTimeout(snapshotSyncTimerRef.current);
+        }
+    }, [messages, triggerSnapshotSync]);
 
     // Group chat: map of characterId → Character for quick lookup
     const groupCharMap = useMemo(() => {
