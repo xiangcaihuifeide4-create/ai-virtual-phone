@@ -3295,82 +3295,41 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
 
         // --- AMSG 后台接管 (能力 B) ---
         let handedOverToBackground = false;
-        let gracePeriodTimer: NodeJS.Timeout | null = null;
         let lastKnownConfig: any = null;
         let lastKnownPromptMessages: any = null;
         
-        const tryHandoverToBackground = (e?: Event) => {
-            if (handedOverToBackground) return; // 已经交接过了
-            
-            const isPagehide = e?.type === "pagehide";
-            // 只有当前还没输出任何文本增量时，才允许交接
+        // 强力接管逻辑：只要离开（切后台/杀进程），立刻把该请求打断并转入后台，不等宽限期。
+        const executeHandover = () => {
+            if (handedOverToBackground) return;
             const hasStartedOutput = streamAccumRef.current.trim().length > 0;
+            // 已经吐字就不接管，避免消息断层
+            if (hasStartedOutput) return;
+
+            handedOverToBackground = true;
+            generationRun.controller.abort();
+
+            console.log("[Background Handover] 页面消失，立即接管生成请求！");
             
-            if (hasStartedOutput) {
-                // 模型已经开始吐字了，就继续本地生成，不交接
-                if (gracePeriodTimer) { clearTimeout(gracePeriodTimer); gracePeriodTimer = null; }
-                return;
-            }
-            
-            if (document.visibilityState === "hidden" || isPagehide) {
-                // 如果是 pagehide 则直接无宽限期接管
-                if (isPagehide) {
-                    executeHandover();
-                } else if (!gracePeriodTimer) {
-                    // 开启几秒钟的宽限期
-                    gracePeriodTimer = setTimeout(() => {
-                        if (document.visibilityState === "hidden") {
-                            executeHandover();
-                        }
-                    }, 3000);
-                }
-            } else {
-                // 页面恢复可见，取消接管
-                if (gracePeriodTimer) {
-                    clearTimeout(gracePeriodTimer);
-                    gracePeriodTimer = null;
-                }
-            }
+            // 通知由于是在后台发送的，可能看不见，但逻辑上要跑
+            showPersistentChatToast("已转入后台生成");
+
+            // 立刻调用 push-jobs 的 PATCH 接口，把当前正挂着的 reply_bailout 的执行时间改为"现在"
+            // (原本要等 90s 无心跳才会触发，现在强制立刻结算)
+            import("@/lib/personal-push-cloud").then(module => {
+                module.pushJobsFetch({
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ triggerKey: `reply:${session.id}`, runNow: true }),
+                }).catch(() => undefined);
+            });
         };
 
-        const executeHandover = () => {
-            if (handedOverToBackground || streamAccumRef.current.trim().length > 0) return;
-            handedOverToBackground = true;
-            
-            // 立即停止本地请求
-            generationRun.controller.abort();
-            
-            if (!lastKnownConfig || !lastKnownPromptMessages) {
-                console.warn("[Background Handover] Missing prompt payload, cannot handover");
-                return;
+        const tryHandoverToBackground = (e?: Event) => {
+            if (handedOverToBackground) return;
+            const isPagehide = e?.type === "pagehide";
+            if (document.visibilityState === "hidden" || isPagehide) {
+                executeHandover();
             }
-            
-            console.log("[Background Handover] Handing over generation to background!");
-            
-            import("@/lib/push-bailout-client").then(module => {
-                import("@/lib/llm-provider-adapter").then(adapterModule => {
-                    const requestMessages = adapterModule.toLlmRequestMessages(lastKnownPromptMessages);
-                    const request = adapterModule.buildProviderRequest(lastKnownConfig, null, requestMessages, { stream: false });
-                    
-                    module.armReplyBailout({
-                        sessionId: session.id,
-                        characterName: character?.name || "对方",
-                        userName: userIdentity?.name || "用户",
-                        regexes: activeRegexes,
-                        request: {
-                            url: request.url,
-                            headers: request.headers,
-                            body: request.body,
-                            providerKind: request.providerKind
-                        }
-                    }).then(handle => {
-                        // 因为是立即交接，我们不需要心跳续命，把租约结算掉，让服务端尽早触发
-                        handle?.settle();
-                    });
-                });
-            });
-            
-            showPersistentChatToast("已转入后台生成，将通过通知送达");
         };
 
         document.addEventListener("visibilitychange", tryHandoverToBackground);
@@ -3385,6 +3344,26 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 lastKnownConfig = promptResult.config;
                 lastKnownPromptMessages = promptResult.llmMessages;
                 
+                // 在发起请求的同时，立刻挂载一个 90s 的兜底预约任务（这是你原本完善的机制）
+                import("@/lib/push-bailout-client").then(module => {
+                    import("@/lib/llm-provider-adapter").then(adapterModule => {
+                        const requestMessages = adapterModule.toLlmRequestMessages(lastKnownPromptMessages);
+                        const request = adapterModule.buildProviderRequest(lastKnownConfig, null, requestMessages, { stream: false });
+                        module.armReplyBailout({
+                            sessionId: session.id,
+                            characterName: character?.name || "对方",
+                            userName: userIdentity?.name || "用户",
+                            regexes: activeRegexes,
+                            request: {
+                                url: request.url,
+                                headers: request.headers,
+                                body: request.body,
+                                providerKind: request.providerKind
+                            }
+                        });
+                    });
+                });
+
                 const results = await generateGroupChatCompletion(
                     session,
                     history,
@@ -3434,6 +3413,25 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 lastKnownConfig = promptResult.config;
                 lastKnownPromptMessages = promptResult.llmMessages;
                 
+                import("@/lib/push-bailout-client").then(module => {
+                    import("@/lib/llm-provider-adapter").then(adapterModule => {
+                        const requestMessages = adapterModule.toLlmRequestMessages(lastKnownPromptMessages);
+                        const request = adapterModule.buildProviderRequest(lastKnownConfig, null, requestMessages, { stream: false });
+                        module.armReplyBailout({
+                            sessionId: session.id,
+                            characterName: character?.name || "对方",
+                            userName: userIdentity?.name || "用户",
+                            regexes: activeRegexes,
+                            request: {
+                                url: request.url,
+                                headers: request.headers,
+                                body: request.body,
+                                providerKind: request.providerKind
+                            }
+                        });
+                    });
+                });
+
                 const cr = await generateChatCompletion(
                     session,
                     history,
@@ -3483,7 +3481,6 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         } finally {
             document.removeEventListener("visibilitychange", tryHandoverToBackground);
             window.removeEventListener("pagehide", tryHandoverToBackground);
-            if (gracePeriodTimer) clearTimeout(gracePeriodTimer);
             
             if (finishGenerationRun(session.id, generationRunId)) {
                 isGeneratingRef.current = false;
